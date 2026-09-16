@@ -2,12 +2,19 @@
 
 #include "lauxlib.h"
 
+#include <limits.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define ELI_XFER_REGISTRY "eli.xfer.adapters"
+#define ELI_XFER_MAX_DEPTH 200
+/* Headroom for an adapter's import_fn, which runs in this C frame: the import
+ * installs metatables and registers adapters before pushing its userdata. Not
+ * routed through a Lua call, so it does not get the usual C-function reserve. */
+#define ELI_XFER_IMPORT_STACK LUA_MINSTACK
 
 typedef enum eli_wire_kind {
 	ELI_WIRE_NIL = 0,
@@ -60,6 +67,9 @@ struct eli_xfer_packet {
 	int *map_nodes;
 	size_t map_count;
 	size_t map_cap;
+	lua_State *source;
+	int source_roots;
+	int finished;
 };
 
 static void set_error(char *errbuf, size_t errlen, const char *format, ...)
@@ -78,6 +88,16 @@ eli_xfer_packet *eli_xfer_packet_new(void)
 {
 	eli_xfer_packet *packet = (eli_xfer_packet *)calloc(1, sizeof(*packet));
 	return packet;
+}
+
+/* Published as one pointer so a packet destruction can never observe a
+ * half-installed begin/end pair. The hooks structure is immutable and
+ * process-lifetime. */
+static _Atomic(const eli_xfer_payload_hooks *) payload_hooks;
+
+void eli_xfer_set_payload_hooks(const eli_xfer_payload_hooks *hooks)
+{
+	atomic_store_explicit(&payload_hooks, hooks, memory_order_release);
 }
 
 static void wire_node_clear(eli_wire_node *node)
@@ -103,26 +123,68 @@ static void wire_node_clear(eli_wire_node *node)
 	node->kind = ELI_WIRE_NIL;
 }
 
+void eli_xfer_encode_finish(eli_xfer_packet *packet)
+{
+	if (packet == NULL || packet->finished) {
+		return;
+	}
+	if (packet->source != NULL) {
+		luaL_unref(packet->source, LUA_REGISTRYINDEX, packet->source_roots);
+		packet->source = NULL;
+	}
+	free(packet->map_ptrs);
+	free(packet->map_nodes);
+	packet->map_ptrs = NULL;
+	packet->map_nodes = NULL;
+	packet->map_count = packet->map_cap = 0;
+	packet->finished = 1;
+}
+
 void eli_xfer_packet_free(eli_xfer_packet *packet)
 {
+	const eli_xfer_payload_hooks *hooks;
 	size_t i;
 
 	if (packet == NULL) {
 		return;
 	}
+	/* Load once: begin and end must come from the same published pair. */
+	hooks = atomic_load_explicit(&payload_hooks, memory_order_acquire);
+	eli_xfer_encode_finish(packet);
+	if (hooks != NULL) {
+		hooks->begin();
+	}
 	for (i = 0; i < packet->node_count; i++) {
 		wire_node_clear(&packet->nodes[i]);
 	}
+	if (hooks != NULL) {
+		hooks->end();
+	}
 	free(packet->nodes);
 	free(packet->roots);
-	free(packet->map_ptrs);
-	free(packet->map_nodes);
 	free(packet);
 }
 
 size_t eli_xfer_packet_roots(const eli_xfer_packet *packet)
 {
 	return packet == NULL ? 0 : packet->root_count;
+}
+
+void eli_xfer_packet_visit_userdata(const eli_xfer_packet *packet,
+				    eli_xfer_userdata_visitor visitor, void *context)
+{
+	size_t i;
+
+	if (packet == NULL || visitor == NULL) {
+		return;
+	}
+	for (i = 0; i < packet->node_count; i++) {
+		const eli_wire_node *node = &packet->nodes[i];
+		if (node->kind == ELI_WIRE_USERDATA) {
+			visitor(node->u.userdata.adapter, node->u.userdata.data,
+				node->u.userdata.size, context);
+		}
+	}
 }
 
 /* ---- adapter registry ---- */
@@ -148,7 +210,7 @@ int eli_xfer_register(lua_State *L, int metatable_index,
 	lua_pushlightuserdata(L, (void *)adapter);
 	lua_rawset(L, -3);
 	lua_pop(L, 1);
-	return 1;
+	return 0;
 }
 
 static const eli_xfer_adapter *find_adapter(lua_State *L, int index)
@@ -178,41 +240,95 @@ typedef struct encode_ctx {
 	eli_xfer_packet *packet;
 	char *errbuf;
 	size_t errlen;
+	size_t depth;
+	int failed;
 } encode_ctx;
 
-static int packet_map_find(eli_xfer_packet *packet, const void *pointer)
+/* Open-addressed identity map. Object pointers are at least pointer-aligned,
+ * so mix away the low bits to spread power-of-two buckets. */
+static size_t packet_map_hash(const void *pointer)
 {
+	uintptr_t value = (uintptr_t)pointer;
+
+	value ^= value >> 17;
+	value *= (uintptr_t)0xed5ad4bbU;
+	value ^= value >> 11;
+	return (size_t)value;
+}
+
+static size_t packet_map_slot(const eli_xfer_packet *packet,
+			      const void *pointer)
+{
+	size_t mask = packet->map_cap - 1;
+	size_t slot = packet_map_hash(pointer) & mask;
+
+	while (packet->map_ptrs[slot] != NULL &&
+	       packet->map_ptrs[slot] != pointer) {
+		slot = (slot + 1) & mask;
+	}
+	return slot;
+}
+
+static int packet_map_find(const eli_xfer_packet *packet, const void *pointer)
+{
+	size_t slot;
+
+	if (packet->map_cap == 0) {
+		return -1;
+	}
+	slot = packet_map_slot(packet, pointer);
+	if (packet->map_ptrs[slot] == NULL) {
+		return -1;
+	}
+	return packet->map_nodes[slot];
+}
+
+static int packet_map_grow(eli_xfer_packet *packet)
+{
+	size_t new_cap = packet->map_cap == 0 ? 16 : packet->map_cap * 2;
+	const void **ptrs = (const void **)calloc(new_cap, sizeof(*ptrs));
+	int *nodes = (int *)malloc(new_cap * sizeof(*nodes));
+	const void **old_ptrs = packet->map_ptrs;
+	int *old_nodes = packet->map_nodes;
+	size_t old_cap = packet->map_cap;
 	size_t i;
 
-	for (i = 0; i < packet->map_count; i++) {
-		if (packet->map_ptrs[i] == pointer) {
-			return packet->map_nodes[i];
-		}
+	if (ptrs == NULL || nodes == NULL) {
+		free(ptrs);
+		free(nodes);
+		return 0;
 	}
-	return -1;
+	packet->map_ptrs = ptrs;
+	packet->map_nodes = nodes;
+	packet->map_cap = new_cap;
+	for (i = 0; i < old_cap; i++) {
+		size_t slot;
+		if (old_ptrs[i] == NULL) {
+			continue;
+		}
+		slot = packet_map_slot(packet, old_ptrs[i]);
+		packet->map_ptrs[slot] = old_ptrs[i];
+		packet->map_nodes[slot] = old_nodes[i];
+	}
+	free(old_ptrs);
+	free(old_nodes);
+	return 1;
 }
 
 static int packet_map_add(eli_xfer_packet *packet, const void *pointer,
 			  int node_index)
 {
-	if (packet->map_count == packet->map_cap) {
-		size_t cap = packet->map_cap == 0 ? 16 : packet->map_cap * 2;
-		const void **ptrs = (const void **)realloc(
-		   packet->map_ptrs, cap * sizeof(*ptrs));
-		int *nodes;
-		if (ptrs == NULL) {
+	size_t slot;
+
+	if (packet->map_cap == 0 ||
+	    packet->map_count + 1 > packet->map_cap - packet->map_cap / 4) {
+		if (!packet_map_grow(packet)) {
 			return 0;
 		}
-		packet->map_ptrs = ptrs;
-		nodes = (int *)realloc(packet->map_nodes, cap * sizeof(*nodes));
-		if (nodes == NULL) {
-			return 0;
-		}
-		packet->map_nodes = nodes;
-		packet->map_cap = cap;
 	}
-	packet->map_ptrs[packet->map_count] = pointer;
-	packet->map_nodes[packet->map_count] = node_index;
+	slot = packet_map_slot(packet, pointer);
+	packet->map_ptrs[slot] = pointer;
+	packet->map_nodes[slot] = node_index;
 	packet->map_count++;
 	return 1;
 }
@@ -233,6 +349,10 @@ static int packet_new_node(eli_xfer_packet *packet, eli_wire_kind kind,
 		}
 		packet->nodes = nodes;
 		packet->node_cap = cap;
+	}
+	if (packet->node_count > (size_t)INT_MAX) {
+		set_error(errbuf, errlen, "too many transferable values");
+		return -1;
 	}
 	index = (int)packet->node_count;
 	memset(&packet->nodes[index], 0, sizeof(packet->nodes[index]));
@@ -262,8 +382,7 @@ static int packet_add_root(eli_xfer_packet *packet, int node_index,
 static int encode_value(encode_ctx *ctx, lua_State *L, int index);
 
 typedef struct lua_dump_buffer {
-	char *data;
-	size_t len;
+	eli_wire_node *node;
 	size_t cap;
 	int failed;
 } lua_dump_buffer;
@@ -276,22 +395,27 @@ static int dump_writer(lua_State *L, const void *data, size_t size, void *ud)
 	if (buffer->failed) {
 		return 1;
 	}
-	if (buffer->len + size > buffer->cap) {
+	/* Lua 5.5 ends a dump with a NULL, zero-length write. */
+	if (size == 0) {
+		return 0;
+	}
+	if (buffer->node->u.bytes.len + size > buffer->cap) {
 		size_t cap = buffer->cap == 0 ? 256 : buffer->cap;
 		char *grown;
-		while (cap < buffer->len + size) {
+		while (cap < buffer->node->u.bytes.len + size) {
 			cap *= 2;
 		}
-		grown = (char *)realloc(buffer->data, cap);
+		grown = (char *)realloc(buffer->node->u.bytes.data, cap);
 		if (grown == NULL) {
 			buffer->failed = 1;
 			return 1;
 		}
-		buffer->data = grown;
+		/* lua_dump can raise: the packet must already own this allocation. */
+		buffer->node->u.bytes.data = grown;
 		buffer->cap = cap;
 	}
-	memcpy(buffer->data + buffer->len, data, size);
-	buffer->len += size;
+	memcpy(buffer->node->u.bytes.data + buffer->node->u.bytes.len, data, size);
+	buffer->node->u.bytes.len += size;
 	return 0;
 }
 
@@ -357,19 +481,16 @@ static int encode_function(encode_ctx *ctx, lua_State *L, int index,
 	}
 
 	{
-		lua_dump_buffer buffer = {NULL, 0, 0, 0};
+		lua_dump_buffer buffer = {node, 0, 0};
 		int status;
 		lua_pushvalue(L, index);
 		status = lua_dump(L, dump_writer, &buffer, 0);
 		lua_pop(L, 1);
 		if (status != 0 || buffer.failed) {
-			free(buffer.data);
 			set_error(ctx->errbuf, ctx->errlen,
 				  "failed to dump function bytecode");
 			return 0;
 		}
-		node->u.bytes.data = buffer.data;
-		node->u.bytes.len = buffer.len;
 		node->env_upvalue = env_upvalue;
 	}
 	(void)pointer;
@@ -384,6 +505,16 @@ static int encode_table(encode_ctx *ctx, lua_State *L, int index,
 	size_t count = 0;
 	size_t i = 0;
 
+	if (++ctx->depth > ELI_XFER_MAX_DEPTH) {
+		set_error(ctx->errbuf, ctx->errlen,
+			  "table is too deeply nested to transfer");
+		return 0;
+	}
+	if (!lua_checkstack(L, 3)) {
+		set_error(ctx->errbuf, ctx->errlen,
+			  "out of Lua stack while transferring a table");
+		return 0;
+	}
 	index = lua_absindex(L, index);
 
 	lua_pushnil(L);
@@ -404,8 +535,16 @@ static int encode_table(encode_ctx *ctx, lua_State *L, int index,
 
 	lua_pushnil(L);
 	while (lua_next(L, index) != 0) {
-		int key = encode_value(ctx, L, -2);
-		int value = key < 0 ? -1 : encode_value(ctx, L, -1);
+		int key;
+		int value;
+		if (i >= count) {
+			set_error(ctx->errbuf, ctx->errlen,
+				  "table mutated during transfer");
+			lua_pop(L, 1);
+			return 0;
+		}
+		key = encode_value(ctx, L, -2);
+		value = key < 0 ? -1 : encode_value(ctx, L, -1);
 		lua_pop(L, 1);
 		if (key < 0 || value < 0) {
 			return 0;
@@ -414,6 +553,8 @@ static int encode_table(encode_ctx *ctx, lua_State *L, int index,
 		entries[i].value = value;
 		i++;
 	}
+	packet->nodes[node_index].u.table.count = i;
+	ctx->depth--;
 	return 1;
 }
 
@@ -424,6 +565,13 @@ static int encode_value(encode_ctx *ctx, lua_State *L, int index)
 	int node_index;
 
 	index = lua_absindex(L, index);
+	/* Adapter lookup, function inspection and metatable access push up to
+	 * four transient values without reserving stack space themselves. */
+	if (!lua_checkstack(L, 4)) {
+		set_error(ctx->errbuf, ctx->errlen,
+			  "out of Lua stack while transferring a value");
+		return -1;
+	}
 	value_type = lua_type(L, index);
 
 	switch (value_type) {
@@ -476,6 +624,12 @@ static int encode_value(encode_ctx *ctx, lua_State *L, int index)
 		if (existing >= 0) {
 			return existing;
 		}
+		/* Root before adapters or recursive encoding can run GC. The map
+		 * survives encode calls, so stack arguments alone are insufficient. */
+		lua_rawgeti(L, LUA_REGISTRYINDEX, packet->source_roots);
+		lua_pushvalue(L, index);
+		lua_rawsetp(L, -2, pointer);
+		lua_pop(L, 1);
 		if (value_type == LUA_TTABLE) {
 			if (lua_getmetatable(L, index)) {
 				lua_pop(L, 1);
@@ -580,25 +734,64 @@ static int encode_value(encode_ctx *ctx, lua_State *L, int index)
 	}
 }
 
+static int encode_protected(lua_State *L)
+{
+	encode_ctx *ctx = (encode_ctx *)lua_touserdata(L, 1);
+	int count = lua_gettop(L);
+	int i;
+
+	if (ctx->packet->source == NULL) {
+		lua_newtable(L);
+		lua_pushthread(L);
+		lua_rawseti(L, -2, 0);
+		ctx->packet->source_roots = luaL_ref(L, LUA_REGISTRYINDEX);
+		ctx->packet->source = L;
+	}
+	for (i = 2; i <= count; i++) {
+		int node = encode_value(ctx, L, i);
+		if (node < 0 || !packet_add_root(ctx->packet, node,
+					       ctx->errbuf, ctx->errlen)) {
+			ctx->failed = 1;
+			break;
+		}
+	}
+	return 0;
+}
+
 int eli_xfer_encode(lua_State *L, eli_xfer_packet *packet, const int *indices,
 		    size_t count, char *errbuf, size_t errlen)
 {
-	encode_ctx ctx = {packet, errbuf, errlen};
+	encode_ctx ctx = {packet, errbuf, errlen, 0, 0};
+	int top = lua_gettop(L);
 	size_t i;
 
 	if (errbuf != NULL && errlen > 0) {
 		errbuf[0] = '\0';
 	}
-	for (i = 0; i < count; i++) {
-		int node = encode_value(&ctx, L, indices[i]);
-		if (node < 0) {
-			return 1;
-		}
-		if (!packet_add_root(packet, node, errbuf, errlen)) {
-			return 1;
-		}
+	if (packet->finished || (packet->source != NULL && packet->source != L)) {
+		set_error(errbuf, errlen, "transfer encoding session is finished or belongs to another Lua thread");
+		return 1;
 	}
-	return 0;
+	if (count > INT_MAX - 2 || !lua_checkstack(L, (int)count + 2)) {
+		set_error(errbuf, errlen, "out of Lua stack while transferring values");
+		return 1;
+	}
+	lua_pushcfunction(L, encode_protected);
+	lua_pushlightuserdata(L, &ctx);
+	for (i = 0; i < count; i++) {
+		int index = indices[i];
+		if (index < 0 && index > LUA_REGISTRYINDEX) index += top + 1;
+		lua_pushvalue(L, index);
+	}
+	/* Both Lua's dumper and adapters can raise; callers must regain control
+	 * to free the partially encoded packet on every error path. */
+	if (lua_pcall(L, (int)count + 1, 0, 0) != LUA_OK) {
+		set_error(errbuf, errlen, "%s", lua_type(L, -1) == LUA_TSTRING
+			  ? lua_tostring(L, -1) : "error while transferring values");
+		ctx.failed = 1;
+	}
+	lua_settop(L, top);
+	return ctx.failed;
 }
 
 /* ---- decode ---- */
@@ -607,8 +800,41 @@ typedef struct decode_ctx {
 	const eli_xfer_packet *packet;
 	char *errbuf;
 	size_t errlen;
+	size_t depth;
 	int seen; /* absolute stack index of the identity table */
 } decode_ctx;
+
+static int decode_value(decode_ctx *ctx, lua_State *L, int node_index);
+
+static int decode_table_entries(decode_ctx *ctx, lua_State *L,
+				const eli_wire_node *node, int table_index)
+{
+	size_t i;
+
+	if (++ctx->depth > ELI_XFER_MAX_DEPTH) {
+		set_error(ctx->errbuf, ctx->errlen,
+			  "packet is too deeply nested to decode");
+		return 0;
+	}
+	if (!lua_checkstack(L, 3)) {
+		set_error(ctx->errbuf, ctx->errlen,
+			  "out of Lua stack while decoding a table");
+		return 0;
+	}
+	table_index = lua_absindex(L, table_index);
+	for (i = 0; i < node->u.table.count; i++) {
+		const eli_wire_entry *entry = &node->u.table.entries[i];
+		if (!decode_value(ctx, L, entry->key)) {
+			return 0;
+		}
+		if (!decode_value(ctx, L, entry->value)) {
+			return 0;
+		}
+		lua_rawset(L, table_index);
+	}
+	ctx->depth--;
+	return 1;
+}
 
 static int decode_value(decode_ctx *ctx, lua_State *L, int node_index)
 {
@@ -637,7 +863,6 @@ static int decode_value(decode_ctx *ctx, lua_State *L, int node_index)
 		lua_pushlstring(L, node->u.bytes.data, node->u.bytes.len);
 		return 1;
 	case ELI_WIRE_TABLE: {
-		size_t i;
 		lua_rawgeti(L, ctx->seen, node_index);
 		if (!lua_isnil(L, -1)) {
 			return 1;
@@ -646,17 +871,7 @@ static int decode_value(decode_ctx *ctx, lua_State *L, int node_index)
 		lua_createtable(L, 0, (int)node->u.table.count);
 		lua_pushvalue(L, -1);
 		lua_rawseti(L, ctx->seen, node_index);
-		for (i = 0; i < node->u.table.count; i++) {
-			const eli_wire_entry *entry = &node->u.table.entries[i];
-			if (!decode_value(ctx, L, entry->key)) {
-				return 0;
-			}
-			if (!decode_value(ctx, L, entry->value)) {
-				return 0;
-			}
-			lua_rawset(L, -3);
-		}
-		return 1;
+		return decode_table_entries(ctx, L, node, -1);
 	}
 	case ELI_WIRE_FUNCTION: {
 		int function_index;
@@ -700,6 +915,11 @@ static int decode_value(decode_ctx *ctx, lua_State *L, int node_index)
 			return 1;
 		}
 		lua_pop(L, 1);
+		if (!lua_checkstack(L, ELI_XFER_IMPORT_STACK)) {
+			set_error(ctx->errbuf, ctx->errlen,
+				  "out of Lua stack while importing transferred userdata");
+			return 0;
+		}
 		status = node->u.userdata.adapter->import_fn(
 		   L, node->u.userdata.data, node->u.userdata.size);
 		if (status != 0) {
@@ -732,10 +952,63 @@ int eli_xfer_decode(lua_State *L, const eli_xfer_packet *packet, char *errbuf,
 	ctx.packet = packet;
 	ctx.errbuf = errbuf;
 	ctx.errlen = errlen;
+	ctx.depth = 0;
 	lua_newtable(L);
 	ctx.seen = lua_gettop(L);
 	for (i = 0; i < packet->root_count; i++) {
+		if (!lua_checkstack(L, 3)) {
+			set_error(ctx.errbuf, ctx.errlen,
+				  "out of Lua stack while decoding values");
+			return 1;
+		}
 		if (!decode_value(&ctx, L, packet->roots[i])) {
+			return 1;
+		}
+	}
+	lua_remove(L, ctx.seen);
+	return 0;
+}
+
+int eli_xfer_decode_into(lua_State *L, const eli_xfer_packet *packet,
+			 int target_index, char *errbuf, size_t errlen)
+{
+	decode_ctx ctx;
+	size_t i;
+
+	if (errbuf != NULL && errlen > 0) {
+		errbuf[0] = '\0';
+	}
+	ctx.packet = packet;
+	ctx.errbuf = errbuf;
+	ctx.errlen = errlen;
+	ctx.depth = 0;
+	target_index = lua_absindex(L, target_index);
+	lua_newtable(L);
+	ctx.seen = lua_gettop(L);
+	for (i = 0; i < packet->root_count; i++) {
+		int node_index = packet->roots[i];
+		const eli_wire_node *node;
+
+		if (!lua_checkstack(L, 3)) {
+			set_error(ctx.errbuf, ctx.errlen,
+				  "out of Lua stack while decoding values");
+			return 1;
+		}
+		if (node_index < 0 ||
+		    (size_t)node_index >= packet->node_count) {
+			set_error(ctx.errbuf, ctx.errlen,
+				  "corrupt worker packet");
+			return 1;
+		}
+		node = &packet->nodes[node_index];
+		if (node->kind == ELI_WIRE_TABLE) {
+			lua_pushvalue(L, target_index);
+			lua_rawseti(L, ctx.seen, node_index);
+			if (!decode_table_entries(&ctx, L, node,
+						  target_index)) {
+				return 1;
+			}
+		} else if (!decode_value(&ctx, L, node_index)) {
 			return 1;
 		}
 	}

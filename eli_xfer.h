@@ -4,9 +4,9 @@
 /*
  * Versioned native userdata-transfer API.
  *
- * Packets are native-owned snapshots of a Lua value graph. They contain no
- * borrowed Lua pointers and can therefore be moved between independent Lua
- * states (worker threads). Adapters are immutable, process-lifetime
+ * Finished packets are native-owned snapshots of a Lua value graph with no
+ * borrowed Lua pointers, movable between independent Lua states (worker
+ * threads). Adapters are immutable, process-lifetime
  * definitions; each state registers its userdata metatable explicitly.
  */
 
@@ -41,13 +41,39 @@ typedef struct eli_xfer_adapter {
 int eli_xfer_register(lua_State *L, int metatable_index,
 		      const eli_xfer_adapter *adapter);
 
+typedef struct eli_xfer_payload_hooks {
+	void (*begin)(void);
+	void (*end)(void);
+} eli_xfer_payload_hooks;
+
 eli_xfer_packet *eli_xfer_packet_new(void);
+/* Optional hooks invoked around the destruction of a packet's payloads.
+ * They let an adapter batch process-wide bookkeeping across the many
+ * payloads of one packet (for example channel cycle collection). Both
+ * fields must be set. 'hooks' must have static storage duration; it is
+ * published atomically and may be installed while other threads already
+ * free packets. Set once for the process lifetime. */
+void eli_xfer_set_payload_hooks(const eli_xfer_payload_hooks *hooks);
+/* End encoding on the source thread before handoff or closing its Lua state.
+ * Releases source roots and identity map; idempotent, never allocates/raises.
+ * Requires one spare stack slot on the source Lua thread. No further encoding
+ * is allowed. Free also finishes an unfinished packet, and must therefore run
+ * on its source thread while that state is alive. */
+void eli_xfer_encode_finish(eli_xfer_packet *packet);
 void eli_xfer_packet_free(eli_xfer_packet *packet);
 size_t eli_xfer_packet_roots(const eli_xfer_packet *packet);
 
+/* Visit every native userdata payload in a packet. The visitor must not free
+ * or otherwise mutate the payload. */
+typedef void (*eli_xfer_userdata_visitor)(const eli_xfer_adapter *adapter,
+					  void *data, size_t size, void *context);
+void eli_xfer_packet_visit_userdata(const eli_xfer_packet *packet,
+				    eli_xfer_userdata_visitor visitor, void *context);
+
 /* Encode 'count' stack values (at the given absolute or relative indices)
  * as new roots of 'packet'. Object identity (tables, functions, registered
- * userdata) is preserved across all calls sharing one packet.
+ * userdata) is preserved across all calls sharing one packet. Calls must use
+ * the same Lua thread; mapped objects and that thread are rooted until finish.
  * Returns 0 on success. On failure writes an error message to 'errbuf' and
  * returns nonzero; the packet may hold partially built data and must still
  * be freed. */
@@ -59,5 +85,12 @@ int eli_xfer_encode(lua_State *L, eli_xfer_packet *packet, const int *indices,
  * caller must reset the stack. */
 int eli_xfer_decode(lua_State *L, const eli_xfer_packet *packet, char *errbuf,
 		    size_t errlen);
+
+/* Like eli_xfer_decode, but merges root tables into the table at
+ * 'target_index' instead of creating new ones, so references back to the
+ * root keep their identity when the target is the destination globals
+ * table. Non-table roots are decoded onto the stack as usual. */
+int eli_xfer_decode_into(lua_State *L, const eli_xfer_packet *packet,
+			 int target_index, char *errbuf, size_t errlen);
 
 #endif /* ELI_XFER_H */
