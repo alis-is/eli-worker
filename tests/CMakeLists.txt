@@ -6,6 +6,7 @@ target_compile_definitions(eli_worker PRIVATE ELI_WORKER_TESTS)
 add_executable(eli_worker_constructor_test
   constructor.c
   ../eli_channel.c
+  ../eli_mutex.c
   ../eli_xfer.c
   ../eli_worker_test.c
   ../../lua/onelua.c)

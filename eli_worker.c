@@ -401,7 +401,7 @@ static void setup_environment(lua_State *L, const eli_spawn_data *data)
 			luaL_error(L, "%s", error);
 		}
 		/* Register worker preloads before elify iterates package.preload. */
-		luaL_requiref(L, "eli_worker", luaopen_eli_worker, 0);
+		luaL_requiref(L, "eli.worker", luaopen_eli_worker, 0);
 		lua_pop(L, 1);
 		lua_getglobal(L, "require");
 		lua_pushstring(L, "eli.elify");
@@ -577,6 +577,11 @@ static int worker_channel(lua_State *L)
 		}
 	}
 	return eli_channel_create(L, (size_t)capacity);
+}
+
+static int worker_mutex(lua_State *L)
+{
+	return eli_mutex_create(L);
 }
 
 static int worker_active(lua_State *L)
@@ -1018,6 +1023,7 @@ int luaopen_eli_worker(lua_State *L)
 	}
 	eli_runtime_set_main_state(L);
 	eli_worker_install_channel(L);
+	eli_worker_install_mutex(L);
 	eli_worker_install_handle(L);
 	eli_worker_install_locale_guard(L);
 
@@ -1026,6 +1032,8 @@ int luaopen_eli_worker(lua_State *L)
 	lua_setfield(L, -2, "spawn");
 	lua_pushcfunction(L, worker_channel);
 	lua_setfield(L, -2, "channel");
+	lua_pushcfunction(L, worker_mutex);
+	lua_setfield(L, -2, "mutex");
 	lua_pushcfunction(L, worker_active);
 	lua_setfield(L, -2, "active_count");
 #ifdef ELI_WORKER_TESTS
@@ -1036,7 +1044,7 @@ int luaopen_eli_worker(lua_State *L)
 			lua_getfield(L, -1, "preload");
 			if (lua_istable(L, -1)) {
 				lua_pushcfunction(L, luaopen_eli_worker_test);
-				lua_setfield(L, -2, "eli_worker.test");
+				lua_setfield(L, -2, "eli.worker.test");
 			}
 			lua_pop(L, 1);
 		}

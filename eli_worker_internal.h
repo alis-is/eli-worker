@@ -13,6 +13,7 @@
 #include <time.h>
 
 #define ELI_CHANNEL_MT "eli.worker.channel"
+#define ELI_MUTEX_MT "eli.worker.mutex"
 #define ELI_WORKER_MT "eli.worker.handle"
 
 /* Use the actual integer type's limit, without signed shifts or width guesses. */
@@ -101,6 +102,16 @@ eli_channel *eli_channel_check(lua_State *L, int index);
 int eli_worker_open_channel(lua_State *L, int upvalue);
 void eli_worker_install_channel(lua_State *L);
 const eli_xfer_adapter *eli_worker_channel_adapter(void);
+
+/* ---- mutexes ---- */
+
+typedef struct eli_mutex eli_mutex;
+
+int eli_mutex_create(lua_State *L);
+int eli_mutex_push(lua_State *L, eli_mutex *mutex);
+eli_mutex *eli_mutex_check(lua_State *L, int index);
+void eli_worker_install_mutex(lua_State *L);
+size_t eli_mutex_live_count(void);
 
 /* ---- workers ---- */
 

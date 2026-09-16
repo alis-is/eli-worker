@@ -8,8 +8,8 @@
 
 #include <stdlib.h>
 
-#define ELI_WORKER_TEST_BOX_MT "eli_worker.test.box"
-#define ELI_WORKER_TEST_IMPORT_HOOK "eli_worker.test.import_hook"
+#define ELI_WORKER_TEST_BOX_MT "eli.worker.test.box"
+#define ELI_WORKER_TEST_IMPORT_HOOK "eli.worker.test.import_hook"
 
 typedef struct test_box {
 	lua_Integer value;
@@ -118,6 +118,12 @@ static int test_channel_count(lua_State *L)
 	return 1;
 }
 
+static int test_mutex_count(lua_State *L)
+{
+	lua_pushinteger(L, (lua_Integer)eli_mutex_live_count());
+	return 1;
+}
+
 static int test_set_import_hook(lua_State *L)
 {
 	if (!lua_isnoneornil(L, 1)) {
@@ -139,6 +145,8 @@ int luaopen_eli_worker_test(lua_State *L)
 	lua_setfield(L, -2, "value");
 	lua_pushcfunction(L, test_channel_count);
 	lua_setfield(L, -2, "channel_count");
+	lua_pushcfunction(L, test_mutex_count);
+	lua_setfield(L, -2, "mutex_count");
 	lua_pushcfunction(L, test_set_import_hook);
 	lua_setfield(L, -2, "set_import_hook");
 	return 1;

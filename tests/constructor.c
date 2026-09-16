@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifndef _WIN32
 #include <pthread.h>
@@ -180,8 +181,8 @@ static void test_worker_main_state_takeover(void)
 	assert(luaL_loadstring(L,
 	   "return function(gate) "
 	   "gate:receive() "
-	   "package.loaded['eli_worker'] = nil "
-	   "require'eli_worker' "
+	   "package.loaded['eli.worker'] = nil "
+	   "require'eli.worker' "
 	   "local signal = require'eli.os.extra'.signal "
 	   "local ok, err = pcall(signal.poll, 2000) "
 	   "assert(not ok and err:find('main state', 1, true), tostring(err)) "
@@ -466,13 +467,13 @@ static void test_finalizer_during_join_decode(void)
 	assert(L != NULL);
 	assert(luaopen_eli_worker(L) == 1);
 	lua_pop(L, 1);
-	luaL_requiref(L, "eli_worker.test", luaopen_eli_worker_test, 0);
+	luaL_requiref(L, "eli.worker.test", luaopen_eli_worker_test, 0);
 	lua_pop(L, 1);
 
 	assert(luaL_loadstring(L,
 			      "return function() "
-			      "require'eli_worker' "
-			      "return require'eli_worker.test'.box(7) "
+			      "require'eli.worker' "
+			      "return require'eli.worker.test'.box(7) "
 			      "end") == LUA_OK);
 	assert(lua_pcall(L, 0, 1, 0) == LUA_OK);
 	lua_createtable(L, 0, 2);
@@ -490,17 +491,17 @@ static void test_finalizer_during_join_decode(void)
 	/* The hook finalizes the handle while worker_join is decoding results. */
 	lua_pushvalue(L, -1);
 	lua_pushcclosure(L, finalize_handle_hook, 1);
-	lua_setfield(L, LUA_REGISTRYINDEX, "eli_worker.test.import_hook");
+	lua_setfield(L, LUA_REGISTRYINDEX, "eli.worker.test.import_hook");
 
 	lua_pushcfunction(L, worker_join);
 	lua_insert(L, -2);
 	assert(lua_pcall(L, 1, LUA_MULTRET, 0) == LUA_OK);
 	assert(lua_gettop(L) == 2);
 	assert(lua_toboolean(L, 1) == 1);
-	assert(luaL_testudata(L, -1, "eli_worker.test.box") != NULL);
+	assert(luaL_testudata(L, -1, "eli.worker.test.box") != NULL);
 
 	lua_pushnil(L);
-	lua_setfield(L, LUA_REGISTRYINDEX, "eli_worker.test.import_hook");
+	lua_setfield(L, LUA_REGISTRYINDEX, "eli.worker.test.import_hook");
 	lua_settop(L, 0);
 	lua_gc(L, LUA_GCCOLLECT, 0);
 	lua_close(L);
@@ -557,7 +558,7 @@ static void test_long_join_error_allocation_failure(void)
 	lua_pushlightuserdata(L, &state);
 	lua_pushvalue(L, 2);
 	lua_pushcclosure(L, fail_long_import, 2);
-	lua_setfield(L, LUA_REGISTRYINDEX, "eli_worker.test.import_hook");
+	lua_setfield(L, LUA_REGISTRYINDEX, "eli.worker.test.import_hook");
 	lua_pushcfunction(L, worker_join);
 	lua_pushvalue(L, 1);
 	status = lua_pcall(L, 1, 2, 0);
@@ -567,8 +568,72 @@ static void test_long_join_error_allocation_failure(void)
 	assert(lua_rawequal(L, 2, -1));
 	assert(worker->refs == 1);
 	lua_pushnil(L);
-	lua_setfield(L, LUA_REGISTRYINDEX, "eli_worker.test.import_hook");
+	lua_setfield(L, LUA_REGISTRYINDEX, "eli.worker.test.import_hook");
 	lua_close(L);
+}
+
+/* A state closed while holding a lock must release it. The main state has no
+ * worker-exit hook, so __gc is the only path that can unlock the box; the
+ * packet reference keeps the native mutex inspectable after lua_close. */
+static void test_state_close_releases_held_mutex(void)
+{
+	lua_State *L = luaL_newstate();
+	lua_State *receiver = luaL_newstate();
+	eli_xfer_packet *packet = eli_xfer_packet_new();
+	char error[256];
+	size_t live = eli_mutex_live_count();
+	int index = -1;
+
+	assert(L != NULL && receiver != NULL && packet != NULL);
+	assert(luaopen_eli_worker(L) == 1);
+	lua_pop(L, 1);
+	assert(eli_mutex_create(L) == 1);
+	lua_getfield(L, -1, "lock");
+	lua_pushvalue(L, -2);
+	assert(lua_pcall(L, 1, 0, 0) == LUA_OK);
+	assert(eli_xfer_encode(L, packet, &index, 1, error, sizeof(error)) == 0);
+	eli_xfer_encode_finish(packet);
+	lua_close(L);
+
+	assert(luaopen_eli_worker(receiver) == 1);
+	lua_pop(receiver, 1);
+	assert(eli_xfer_decode(receiver, packet, error, sizeof(error)) == 0);
+	lua_getfield(receiver, -1, "try_lock");
+	lua_pushvalue(receiver, -2);
+	assert(lua_pcall(receiver, 1, 1, 0) == LUA_OK);
+	assert(lua_toboolean(receiver, -1) == 1);
+	lua_pop(receiver, 1);
+	eli_xfer_packet_free(packet);
+	lua_close(receiver);
+	assert(eli_mutex_live_count() == live);
+}
+
+static int untransferable_probe(lua_State *L)
+{
+	(void)L;
+	return 0;
+}
+
+/* An encode that fails after the mutex node was added must still release the
+ * packet's reference when the packet is freed. */
+static void test_partial_encode_releases_mutex_reference(void)
+{
+	lua_State *L = luaL_newstate();
+	eli_xfer_packet *packet = eli_xfer_packet_new();
+	char error[256];
+	size_t live = eli_mutex_live_count();
+	int indices[2] = {1, 2};
+
+	assert(L != NULL && packet != NULL);
+	assert(luaopen_eli_worker(L) == 1);
+	lua_pop(L, 1);
+	assert(eli_mutex_create(L) == 1);
+	lua_pushcfunction(L, untransferable_probe);
+	assert(eli_xfer_encode(L, packet, indices, 2, error, sizeof(error)) != 0);
+	assert(strstr(error, "C function") != NULL);
+	eli_xfer_packet_free(packet);
+	lua_close(L);
+	assert(eli_mutex_live_count() == live);
 }
 
 static void test_source_map_gc_lifetime(void)
@@ -584,10 +649,10 @@ static void test_source_map_gc_lifetime(void)
 	luaL_openlibs(L);
 	/* Eli's library loader leaves the preload chunk's result on the stack. */
 	lua_settop(L, 0);
-	luaL_requiref(L, "eli_worker.test", luaopen_eli_worker_test, 0);
+	luaL_requiref(L, "eli.worker.test", luaopen_eli_worker_test, 0);
 	lua_pop(L, 1);
 	assert(luaL_dostring(L,
-	   "local t = { {}, function() end, require'eli_worker.test'.box(9) } "
+	   "local t = { {}, function() end, require'eli.worker.test'.box(9) } "
 	   "return setmetatable({t, t[1], t[2], t[3]}, {__mode='v'}), t") == LUA_OK);
 	assert(lua_gettop(L) == 2 && lua_istable(L, 1) && lua_istable(L, 2));
 	assert(eli_xfer_encode(L, packet, &index, 1, error, sizeof(error)) == 0);
@@ -663,6 +728,8 @@ int main(void)
 	test_successful_spawn();
 	test_finalizer_during_join_decode();
 	test_long_join_error_allocation_failure();
+	test_state_close_releases_held_mutex();
+	test_partial_encode_releases_mutex_reference();
 	test_source_map_gc_lifetime();
 	puts("worker constructor regressions passed");
 	return 0;
