@@ -712,6 +712,186 @@ static void test_source_map_gc_lifetime(void)
 	lua_close(destination);
 }
 
+/* Channels reachable only through other channels must release their native
+ * nodes: cycles, self references and <close> scope exits all used to leak. */
+static void test_channel_reclamation(void)
+{
+	lua_State *L = luaL_newstate();
+	size_t live = eli_channel_live_count();
+
+	assert(L != NULL);
+	luaL_openlibs(L);
+	lua_settop(L, 0);
+	assert(luaL_dostring(L,
+	   "local w = require'eli.worker' "
+	   "local a, b = w.channel(1), w.channel(1) "
+	   "a:send(b) b:send(a) a:close() b:close() "
+	   "a, b = nil, nil "
+	   "collectgarbage'collect' collectgarbage'collect'") == LUA_OK);
+	assert(eli_channel_live_count() == live);
+
+	assert(luaL_dostring(L,
+	   "local ch = require'eli.worker'.channel(1) "
+	   "ch:send(ch) ch:close() ch = nil "
+	   "collectgarbage'collect' collectgarbage'collect'") == LUA_OK);
+	assert(eli_channel_live_count() == live);
+
+	/* <close> releases the native node at chunk scope exit. */
+	assert(luaL_dostring(L,
+	   "do local ch <close> = require'eli.worker'.channel(1) end "
+	   "collectgarbage'collect'") == LUA_OK);
+	assert(eli_channel_live_count() == live);
+
+	/* A cycle with one live root keeps both nodes until it is dropped. */
+	assert(luaL_dostring(L,
+	   "a = require'eli.worker'.channel(1) "
+	   "local b = require'eli.worker'.channel(1) "
+	   "a:send(b) b:send(a) b = nil "
+	   "collectgarbage'collect'") == LUA_OK);
+	assert(eli_channel_live_count() == live + 2);
+	assert(luaL_dostring(L,
+	   "local received = a:receive() "
+	   "assert(received ~= nil) "
+	   "received:close() a:close() a, received = nil, nil "
+	   "collectgarbage'collect' collectgarbage'collect'") == LUA_OK);
+	assert(eli_channel_live_count() == live);
+
+	lua_close(L);
+	assert(eli_channel_live_count() == live);
+}
+
+static void test_bulk_transfer_releases_references(void)
+{
+	lua_State *L = luaL_newstate();
+	size_t channels = eli_channel_live_count();
+	size_t mutexes = eli_mutex_live_count();
+
+	assert(L != NULL);
+	luaL_openlibs(L);
+	lua_settop(L, 0);
+	assert(luaL_dostring(L,
+	   "local w = require'eli.worker' "
+	   "local hub = w.channel(1) "
+	   "local items = {} "
+	   "for i = 1, 256 do items[i] = w.channel(1) end "
+	   "assert(hub:send(items)) "
+	   "local received = hub:receive() "
+	   "hub:close() "
+	   "assert(type(received) == 'table' and #received == 256) "
+	   "hub, items, received = nil, nil, nil "
+	   "collectgarbage'collect' collectgarbage'collect'") == LUA_OK);
+	assert(eli_channel_live_count() == channels);
+
+	assert(luaL_dostring(L,
+	   "local w = require'eli.worker' "
+	   "local hub = w.channel(1) "
+	   "local items = {} "
+	   "for i = 1, 64 do items[i] = w.mutex() end "
+	   "assert(hub:send(items)) "
+	   "local received = hub:receive() "
+	   "hub:close() "
+	   "assert(type(received) == 'table' and #received == 64) "
+	   "hub, items, received = nil, nil, nil "
+	   "collectgarbage'collect' collectgarbage'collect'") == LUA_OK);
+	assert(eli_mutex_live_count() == mutexes);
+
+	lua_close(L);
+	assert(eli_channel_live_count() == channels);
+	assert(eli_mutex_live_count() == mutexes);
+}
+
+static void test_finalized_mutex_reclamation(void)
+{
+	lua_State *L = luaL_newstate();
+	size_t live = eli_mutex_live_count();
+
+	assert(L != NULL);
+	luaL_openlibs(L);
+	lua_settop(L, 0);
+	assert(luaL_dostring(L,
+	   "local w = require'eli.worker' "
+	   "do local m = w.mutex() assert(m:lock()) assert(m:unlock()) end "
+	   "collectgarbage'collect' collectgarbage'collect'") == LUA_OK);
+	assert(eli_mutex_live_count() == live);
+	lua_close(L);
+	assert(eli_mutex_live_count() == live);
+}
+
+/* The fixture adapter must survive an encode/decode round trip and preserve
+ * identity when the same userdata appears twice. */
+static void test_adapter_round_trip_identity(void)
+{
+	lua_State *L = luaL_newstate();
+	lua_State *receiver = luaL_newstate();
+	eli_xfer_packet *packet = eli_xfer_packet_new();
+	char error[256];
+	int index = -1;
+
+	assert(L != NULL && receiver != NULL && packet != NULL);
+	luaL_openlibs(L);
+	lua_settop(L, 0);
+	luaL_requiref(L, "eli.worker.test", luaopen_eli_worker_test, 0);
+	lua_pop(L, 1);
+	assert(luaL_dostring(L,
+	   "local box = require'eli.worker.test'.box(5) "
+	   "return { x = box, y = box }") == LUA_OK);
+	assert(eli_xfer_encode(L, packet, &index, 1, error, sizeof(error)) == 0);
+	eli_xfer_encode_finish(packet);
+	lua_close(L);
+
+	luaL_openlibs(receiver);
+	lua_settop(receiver, 0);
+	assert(eli_xfer_decode(receiver, packet, error, sizeof(error)) == 0);
+	lua_getfield(receiver, -1, "x");
+	lua_getfield(receiver, -2, "y");
+	assert(luaL_testudata(receiver, -2, "eli.worker.test.box") != NULL);
+	assert(lua_rawequal(receiver, -1, -2));
+	eli_xfer_packet_free(packet);
+	lua_close(receiver);
+}
+
+static int raise_import_error(lua_State *L)
+{
+	return luaL_error(L, "adapter import aborted");
+}
+
+/* A failing adapter import must release the packet and leave the channel
+ * usable for the next message. */
+static void test_adapter_import_failure_preserves_channel(void)
+{
+	lua_State *L = luaL_newstate();
+	size_t live = eli_channel_live_count();
+
+	assert(L != NULL);
+	luaL_openlibs(L);
+	lua_settop(L, 0);
+	luaL_requiref(L, "eli.worker.test", luaopen_eli_worker_test, 0);
+	lua_pop(L, 1);
+	assert(luaL_dostring(L,
+	   "local w = require'eli.worker' "
+	   "ch = w.channel(2) "
+	   "local box = require'eli.worker.test'.box "
+	   "assert(ch:send(box(1))) assert(ch:send(box(2)))") == LUA_OK);
+
+	lua_pushcfunction(L, raise_import_error);
+	lua_setfield(L, LUA_REGISTRYINDEX, "eli.worker.test.import_hook");
+	assert(luaL_dostring(L,
+	   "local ok, err = pcall(ch.receive, ch) "
+	   "assert(not ok and tostring(err):find('adapter import aborted', 1, true), "
+	   "tostring(err))") == LUA_OK);
+	lua_pushnil(L);
+	lua_setfield(L, LUA_REGISTRYINDEX, "eli.worker.test.import_hook");
+
+	assert(luaL_dostring(L,
+	   "local box = ch:receive() "
+	   "assert(require'eli.worker.test'.value(box) == 2) "
+	   "ch:close() ch = nil "
+	   "collectgarbage'collect' collectgarbage'collect'") == LUA_OK);
+	assert(eli_channel_live_count() == live);
+	lua_close(L);
+	assert(eli_channel_live_count() == live);
+}
+
 int main(void)
 {
 #ifndef _WIN32
@@ -731,6 +911,11 @@ int main(void)
 	test_state_close_releases_held_mutex();
 	test_partial_encode_releases_mutex_reference();
 	test_source_map_gc_lifetime();
+	test_channel_reclamation();
+	test_bulk_transfer_releases_references();
+	test_finalized_mutex_reclamation();
+	test_adapter_round_trip_identity();
+	test_adapter_import_failure_preserves_channel();
 	puts("worker constructor regressions passed");
 	return 0;
 }
